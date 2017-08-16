@@ -1,0 +1,234 @@
+/*
+
+mybot - Illustrative Slack bot in Go
+
+Copyright (c) 2015 RapidLoop
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+*/
+
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"io/ioutil"
+	"encoding/json"
+	"net/http"
+	"sort"
+	"strconv"
+)
+
+type TickersPipeline interface {
+	FetchCoins(symbol string) (*[]TickerData, error)
+}
+
+type coinMarket struct{}
+
+func makeCoinMarket() TickersPipeline {
+	return &coinMarket{}
+}
+
+var mkt TickersPipeline
+
+func init() {
+	mkt = makeCoinMarket()
+}
+
+type TickerData struct {
+	Id               string  `json:"id"`
+	Name             string  `json:"name"`
+	Symbol           string  `json:"symbol"`
+	Rank             int16    `json:"rank,string"`
+	PriceUSD         float64 `json:"price_usd,string"`
+	PriceBTC         float64 `json:"price_btc,string"`
+	Volume24H        float64 `json:"24h_volume_usd,string"`
+	MarketCapUSD     float64 `json:"market_cap_usd,string"`
+	AvailableSupply  float64 `json:"available_supply,string"`
+	TotalSupply      float64 `json:"total_supply,string"`
+	PercentChange1H  float32 `json:"percent_change_1h,string"`
+	PercentChange24H float32 `json:"percent_change_24h,string"`
+	PercentChange7D  float32 `json:"percent_change_7d,string"`
+	LastUpdated      int32   `json:"last_updated,string"`
+}
+
+func LogError(err error) {
+	fmt.Println(err)
+}
+
+func (mkt *coinMarket) FetchCoins(coinCode string) (*[]TickerData, error) {
+	var resp *http.Response
+	var err error
+	if coinCode == "" {
+		resp, err = http.Get("https://api.coinmarketcap.com/v1/ticker")
+	} else {
+		resp, err = http.Get("https://api.coinmarketcap.com/v1/ticker/" + coinCode + "/")
+	}
+	if err != nil {
+		LogError(err)
+		return nil, err
+	}
+	res, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		LogError(err)
+		return nil, err
+	}
+	var tickers []TickerData
+	err = json.Unmarshal(res, &tickers)
+	if err != nil {
+		LogError(err)
+		return nil, err
+	}
+	return &tickers, nil
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintf(os.Stderr, "usage: mybot slack-bot-token\n")
+		os.Exit(1)
+	}
+
+	// start a websocket-based Real Time API session
+	ws, id := slackConnect(os.Args[1])
+	fmt.Println("My ID: ", id)
+	fmt.Println("mybot ready, ^C exits")
+
+	helpF := func(m Message) {
+		m.Text = "Commands: \ncoin <symbol> => get coin stats \nrank <n> => get top N records sorted by price"
+		postMessage(ws, m)
+	}
+
+	msgF := func(m Message) {
+		recv := func() {
+			if r := recover(); r != nil {
+				println("RECOVER")
+				go helpF(m)
+			}
+		}
+		defer recv()
+		if m.Type == "message" && strings.HasPrefix(m.Text, "<@"+id+">") {
+			// if so try to parse if
+			parts := strings.Fields(m.Text)
+			switch parts[1] {
+			case "coin":
+				// looks good, get the quote and reply with the result
+				go func(m Message) {
+					defer recv()
+					m.Text = getQuote(parts[2])
+					postMessage(ws, m)
+				}(m)
+			case "rank":
+				r, err := strconv.Atoi(parts[2])
+				if err != nil {
+					r = 10
+				}
+				go func(m Message) {
+					m.Text = rankCoins(r)
+					postMessage(ws, m)
+				}(m)
+			default:
+				go helpF(m)
+			}
+			// NOTE: the Message object is copied, this is intentional
+		}
+	}
+
+	loop := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Fatal(r)
+			}
+		}()
+		m, err := getMessage(ws)
+		if err != nil {
+			log.Fatal(err)
+		}
+		msgF(m)
+	}
+
+	for {
+		loop()
+	}
+}
+
+// Get the quote via Yahoo. You should replace this method to something
+// relevant to your team!
+func getQuote(sym string) string {
+
+	coins, err := mkt.FetchCoins("")
+	if err == nil && coins != nil && len(*coins) > 0 {
+		var resp string
+		found := false
+		for _, coin := range *coins {
+			if sym == "" || strings.EqualFold(coin.Symbol, sym) {
+				found = true
+				resp = resp + fmt.Sprintf("%1s $%2.2f, update %3.2f%%\n", coin.Symbol, coin.PriceUSD, coin.PercentChange1H)
+			}
+		}
+		if found {
+			return resp
+		} else {
+			return fmt.Sprintf("'%1s` not found", sym)
+		}
+	} else {
+		return "n/a"
+	}
+
+}
+
+func rankCoins(limit int) string {
+	min := func(l, r int) int {
+		if l < r {
+			return l
+		} else {
+			return r
+		}
+	}
+
+	coins, err := mkt.FetchCoins("")
+	if err == nil && coins != nil && len(*coins) > 0 {
+		var resp string
+		sort.Sort(Sortable(*coins))
+		for _, v := range (*coins)[:min(limit, 30)] {
+			resp = resp + fmt.Sprintf("%1s : %2s => price: $%3.2f : market: $%4.2f\n", v.Name, v.Symbol, v.PriceUSD, v.MarketCapUSD)
+		}
+		return resp
+	} else {
+		return "n/a"
+	}
+
+}
+
+type Sortable []TickerData
+
+func (s Sortable) Less(i, j int) bool {
+	return (s)[i].MarketCapUSD > (s)[j].MarketCapUSD
+}
+
+func (s Sortable) Len() int {
+	return len(s)
+}
+
+func (s Sortable) Swap(i, j int) {
+	tmp := (s)[i]
+	(s)[i] = (s)[j]
+	(s)[j] = tmp
+}
