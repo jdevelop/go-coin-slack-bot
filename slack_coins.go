@@ -88,30 +88,27 @@ func LogError(err error) {
 	fmt.Println(err)
 }
 
-func (mkt *coinMarket) FetchCoins(coinCode string) (*[]TickerData, error) {
+func (mkt *coinMarket) FetchCoins(coinCode string) (result []TickerData, err error) {
+	url := "https://api.coinmarketcap.com/v1/ticker"
+	if coinCode != "" {
+		url = fmt.Sprintf("%s/%s", url, coinCode)
+	}
 	var resp *http.Response
-	var err error
-	if coinCode == "" {
-		resp, err = http.Get("https://api.coinmarketcap.com/v1/ticker")
-	} else {
-		resp, err = http.Get("https://api.coinmarketcap.com/v1/ticker/" + coinCode + "/")
-	}
-	if err != nil {
+	if resp, err = http.Get(url); err != nil {
 		LogError(err)
-		return nil, err
+		return
 	}
-	res, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
+	defer resp.Body.Close()
+	var body []byte
+	if body, err = ioutil.ReadAll(resp.Body); err != nil {
 		LogError(err)
-		return nil, err
+		return
 	}
-	var tickers []TickerData
-	err = json.Unmarshal(res, &tickers)
-	if err != nil {
+	if err = json.Unmarshal(body, &result); err != nil {
 		LogError(err)
-		return nil, err
+		return
 	}
-	return &tickers, nil
+	return
 }
 
 func main() {
