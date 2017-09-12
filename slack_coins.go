@@ -37,10 +37,11 @@ import (
 	"strconv"
 	"time"
 	"math"
+	"github.com/boltdb/bolt"
 )
 
 type TickersPipeline interface {
-	FetchCoins(symbol string) (*[]TickerData, error)
+	FetchCoins(symbol string) ([]TickerData, error)
 }
 
 type coinMarket struct{}
@@ -52,10 +53,10 @@ func makeCoinMarket() TickersPipeline {
 var mkt TickersPipeline
 
 type Watch struct {
-	channel   string
-	name      string
-	lastPrice float64
-	threshold int
+	Channel   string  `json:"channel"`
+	Name      string  `json:"name"`
+	lastPrice float64 `json:"last_price"`
+	Threshold int     `json:"threshold"`
 }
 
 type WatchList map[string]*Watch
@@ -71,7 +72,7 @@ type TickerData struct {
 	Id               string  `json:"id"`
 	Name             string  `json:"name"`
 	Symbol           string  `json:"symbol"`
-	Rank             int16    `json:"rank,string"`
+	Rank             int16   `json:"rank,string"`
 	PriceUSD         float64 `json:"price_usd,string"`
 	PriceBTC         float64 `json:"price_btc,string"`
 	Volume24H        float64 `json:"24h_volume_usd,string"`
@@ -112,14 +113,54 @@ func (mkt *coinMarket) FetchCoins(coinCode string) (result []TickerData, err err
 }
 
 func main() {
+
+	bucketName := []byte("watchlist")
+
 	if len(os.Args) != 2 {
 		fmt.Fprintln(os.Stderr, "usage: mybot slack-bot-token")
 		os.Exit(1)
 	}
 
+	db, err := bolt.Open("coins.db", 0600, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// create storage
+	err = db.Update(func(tx *bolt.Tx) (err error) {
+		_, err = tx.CreateBucketIfNotExists(bucketName)
+		return
+	})
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = db.View(func(tx *bolt.Tx) (err error) {
+		bucket := tx.Bucket(bucketName)
+		c := bucket.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var w Watch
+			if err = json.Unmarshal(v, &w); err == nil {
+				fmt.Println("Loaded", w)
+				watchList[string(k)] = &w
+			} else {
+				fmt.Println(err)
+			}
+		}
+		return
+	})
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// start a websocket-based Real Time API session
 	ws, id := slackConnect(os.Args[1])
 	fmt.Println("My ID: ", id)
+
+	defer db.Close()
+
 	fmt.Println("mybot ready, ^C exits")
 
 	helpF := func(m Message) {
@@ -150,18 +191,30 @@ func main() {
 					parts[2] = strings.ToLower(parts[2])
 					if v, err := mkt.FetchCoins(""); err == nil {
 						var coin *TickerData
-						for _, c := range *v {
+						for _, c := range v {
 							if strings.ToLower(c.Symbol) == parts[2] {
 								coin = &c
 								break
 							}
 						}
 						if coin != nil {
-							watchList[parts[2]] = &Watch{
-								channel:   m.Channel,
-								name:      coin.Name,
+							w := Watch{
+								Channel:   m.Channel,
+								Name:      coin.Name,
 								lastPrice: coin.PriceUSD,
-								threshold: r,
+								Threshold: r,
+							}
+							watchList[parts[2]] = &w
+							err = db.Update(func(tx *bolt.Tx) (err error) {
+								if res, err := json.Marshal(&w); err == nil {
+									fmt.Println(string(res))
+									bucket := tx.Bucket(bucketName)
+									err = bucket.Put([]byte(strings.ToLower(coin.Symbol)), res)
+								}
+								return
+							})
+							if err != nil {
+								fmt.Println(err)
 							}
 						} else {
 							m.Text = "Coin '" + parts[2] + "' does not exist"
@@ -178,9 +231,9 @@ func main() {
 			case "unwatch":
 				delete(watchList, parts[2])
 			case "watchlist":
-				msg := "Tickers: ["
-				for k := range watchList {
-					msg = msg + " " + k + " "
+				msg := "Tickers: [ "
+				for k, v := range watchList {
+					msg = msg + fmt.Sprintf("%1s:%2d ", k, v.Threshold)
 				}
 				m.Text = msg + "]"
 				postMessage(ws, m)
@@ -220,29 +273,29 @@ func main() {
 		msgF(m)
 	}
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(2 * time.Minute)
 
 	go func() {
 		for range ticker.C {
 			for key, sym := range watchList {
-				fmt.Printf("Check %1s : %2s\n", key, sym.name)
-				v, err := mkt.FetchCoins(sym.name)
+				fmt.Printf("Check %1s : %2s\n", key, sym.Name)
+				v, err := mkt.FetchCoins(sym.Name)
 				if err != nil {
 					fmt.Printf("Skipping %1s\n", key)
 					continue
 				}
 				if v != nil && sym.lastPrice > 0 {
-					delta := (*v)[0].PriceUSD - sym.lastPrice
-					fmt.Printf("Delta %1s - %2.2f, threshold %3d\n", key, delta, sym.threshold)
-					if math.Abs(delta) > float64(sym.threshold) {
+					delta := (v)[0].PriceUSD - sym.lastPrice
+					fmt.Printf("Delta %1s - %2.2f, threshold %3d\n", key, delta, sym.Threshold)
+					if math.Abs(delta) > float64(sym.Threshold) {
 						postMessage(ws, Message{
-							Channel: sym.channel,
+							Channel: sym.Channel,
 							Type:    "message",
-							Text:    fmt.Sprintf("[ %1s ] $%+2.2f to $%3.2f", (*v)[0].Symbol, delta, (*v)[0].PriceUSD),
+							Text:    fmt.Sprintf("[ %1s ] $%+2.2f to $%3.2f", (v)[0].Symbol, delta, (v)[0].PriceUSD),
 						})
 					}
 				}
-				sym.lastPrice = (*v)[0].PriceUSD
+				sym.lastPrice = (v)[0].PriceUSD
 			}
 		}
 	}()
@@ -262,10 +315,10 @@ func getQuote(sym []string) string {
 	}
 
 	coins, err := mkt.FetchCoins("")
-	if err == nil && coins != nil && len(*coins) > 0 {
+	if err == nil && coins != nil && len(coins) > 0 {
 		var resp string
 		found := false
-		for _, coin := range *coins {
+		for _, coin := range coins {
 			if _, ok := set[strings.ToLower(coin.Symbol)]; ok {
 				found = true
 				resp = resp + fmt.Sprintf("%1s $%2.2f, update 1H: %3.2f%%, update 24H: %4.2f%%\n",
@@ -293,10 +346,10 @@ func rankCoins(limit int) string {
 	}
 
 	coins, err := mkt.FetchCoins("")
-	if err == nil && coins != nil && len(*coins) > 0 {
+	if err == nil && coins != nil && len(coins) > 0 {
 		var resp string
-		sort.Sort(Sortable(*coins))
-		for _, v := range (*coins)[:min(limit, 30)] {
+		sort.Sort(Sortable(coins))
+		for _, v := range (coins)[:min(limit, 30)] {
 			resp = resp + fmt.Sprintf("%1s : %2s => price: $%3.2f : market: $%4.2f\n", v.Name, v.Symbol, v.PriceUSD, v.MarketCapUSD)
 		}
 		return resp
