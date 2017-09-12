@@ -230,10 +230,17 @@ func main() {
 				}
 			case "unwatch":
 				delete(watchList, parts[2])
+				if err = db.Update(func(tx *bolt.Tx) (err error) {
+					bucket := tx.Bucket(bucketName)
+					err = bucket.Delete([]byte(parts[2]))
+					return
+				}); err != nil {
+					fmt.Println(err)
+				}
 			case "watchlist":
 				msg := "Tickers: [ "
 				for k, v := range watchList {
-					msg = msg + fmt.Sprintf("%1s:%2d ", k, v.Threshold)
+					msg = msg + fmt.Sprintf("{ %1s:%2d }", k, v.Threshold)
 				}
 				m.Text = msg + "]"
 				postMessage(ws, m)
@@ -348,7 +355,9 @@ func rankCoins(limit int) string {
 	coins, err := mkt.FetchCoins("")
 	if err == nil && coins != nil && len(coins) > 0 {
 		var resp string
-		sort.Sort(Sortable(coins))
+		sort.Slice(coins, func(l, r int) bool {
+			return (coins)[l].MarketCapUSD > (coins)[r].MarketCapUSD
+		})
 		for _, v := range (coins)[:min(limit, 30)] {
 			resp = resp + fmt.Sprintf("%1s : %2s => price: $%3.2f : market: $%4.2f\n", v.Name, v.Symbol, v.PriceUSD, v.MarketCapUSD)
 		}
@@ -357,20 +366,4 @@ func rankCoins(limit int) string {
 		return "n/a"
 	}
 
-}
-
-type Sortable []TickerData
-
-func (s Sortable) Less(i, j int) bool {
-	return (s)[i].MarketCapUSD > (s)[j].MarketCapUSD
-}
-
-func (s Sortable) Len() int {
-	return len(s)
-}
-
-func (s Sortable) Swap(i, j int) {
-	tmp := (s)[i]
-	(s)[i] = (s)[j]
-	(s)[j] = tmp
 }
